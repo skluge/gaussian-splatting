@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, lighting_model = None):
     """
     Render the scene. 
     
@@ -53,6 +53,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
+    normals = pc.get_normals   
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -65,12 +66,20 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = pc.get_scaling
         rotations = pc.get_rotation
 
+    if lighting_model is not None:
+        features = override_color = pc.get_features.transpose(1, 2).reshape(-1, 3 * (pc.max_sh_degree+1)**2)
+        override_color = lighting_model(viewpoint_camera.camera_center, pc.get_xyz, normals, features[...,:3], features[...,3:4])
+    else:
+        override_color = pc.get_features.transpose(1, 2).reshape(-1, 3 * (pc.max_sh_degree+1)**2)[...,:3] # FIXME: remove this line
+
+    override_color = torch.cat([override_color, pc.get_features.transpose(1, 2).reshape(-1, 3 * (pc.max_sh_degree+1)**2)[...,:3]], dim=1)
+
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
-    colors_precomp = None
+    colors_precomp = None    
     if override_color is None:
-        if pipe.convert_SHs_python:
+        if pipe.convert_SHs_python:            
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
@@ -81,8 +90,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
 
+    
+
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii = rasterizer(
+    rendered_image, radii, out_depths, out_amax_depth, out_normals = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -90,11 +101,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         opacities = opacity,
         scales = scales,
         rotations = rotations,
+        normals = normals,
         cov3D_precomp = cov3D_precomp)
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    return {"render": rendered_image,
+    return {"render": rendered_image[:3],
+            "albedo": rendered_image[3:6],
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
-            "radii": radii}
+            "radii": radii,
+            "depths": out_depths,
+            "amax_depth": out_amax_depth,
+            "normals": out_normals}

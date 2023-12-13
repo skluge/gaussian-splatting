@@ -12,6 +12,7 @@
 import os
 import torch
 from random import randint
+from utils.depth_utils import get_surface_normal_by_depth
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
@@ -22,6 +23,8 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from relighting.blinn_phong import BlinnPhongModel
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -33,13 +36,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
-    gaussians.training_setup(opt)
+
+    lighting_model = BlinnPhongModel(opt)
+    print(lighting_model.light_position)
+
+    gaussians.training_setup(opt, lighting_model)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -83,14 +92,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, lighting_model = lighting_model)
+        image, viewspace_point_tensor, visibility_filter, radii, depths, amax_depths, normals = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depths"], render_pkg["amax_depth"], render_pkg["normals"]
+
+        #normals_from_depth = get_surface_normal_by_depth(depths.detach(), viewpoint_cam.FoVx, viewpoint_cam.FoVy)
+
+        #if(torch.isnan(normals_from_depth).any()):
+        #    print("Nan in normals_from_depth")
+        #if(torch.isinf(normals_from_depth).any()):
+        #    print("Inf in normals_from_depth")
+        #if(torch.isnan(normals).any()):
+        #    print("Nan in normals")
+        #if(torch.isinf(normals).any()):
+        #    print("Inf in normals")
+
+        #torch.nan_to_num_(normals, 0.0)
+        #torch.clamp_(normals, min=-1.0, max=1.0)
+        #test = torch.full(image.shape, 0.3, device=normals.device)
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+        gt_normals = viewpoint_cam.gt_normals.cuda()
+
+        #import matplotlib.pyplot as plt
+        #plt.imshow(gt_normals.permute(1, 2, 0).cpu().numpy())
+        #plt.show()
+
+        #regularization = torch.nn.functional.mse_loss(lighting_model.ambient_intensity, torch.zeros_like(lighting_model.ambient_intensity))
+
+        #gt_depth = viewpoint_cam.depth.cuda()
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        loss.backward()
+        #loss = 0.95 * ((1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))) \
+        #    + 0.05 * torch.nn.functional.mse_loss(depths, amax_depths) \
+        #    + torch.nn.functional.mse_loss(normals, torch.full(normals.shape, 0.3, device=normals.device))
+            #+ torch.nn.functional.mse_loss(normals, normals_from_depth)
+
+        loss = 0.5 * ((1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)))  \
+            + 0.5 * ((1.0 - opt.lambda_dssim) * l1_loss(normals, gt_normals) + opt.lambda_dssim * (1.0 - ssim(normals, gt_normals))) 
+           # + 0.01 * regularization
+            
+        
+        
+        loss.backward()         
 
         iter_end.record()
 
@@ -104,10 +147,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), lighting_model)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                # save lighting_model
+                torch.save(lighting_model.state_dict(), scene.model_path + "/lighting_model_{}.pth".format(iteration))
+                print(lighting_model.light_position)
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -123,7 +169,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.reset_opacity()
 
             # Optimizer step
-            if iteration < opt.iterations:
+            if iteration < opt.iterations and iteration:
+
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
@@ -153,7 +200,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, lighting_model = None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -170,7 +217,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, lighting_model=lighting_model)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
